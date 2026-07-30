@@ -1,133 +1,113 @@
-CREATE OR REPLACE FUNCTION std16_12fp.f_full_load(p_target varchar, p_ext varchar)
+-- справочники
+CREATE OR REPLACE FUNCTION retail_dwh.f_full_load(p_target varchar, p_ext varchar)
 RETURNS void
 LANGUAGE plpgsql
 VOLATILE
 EXECUTE ON MASTER
 AS $$
+DECLARE
+	v_count bigint;
 BEGIN
-    execute format('truncate table std16_12fp.%I',p_target);
-	execute format('insert into std16_12fp.%I select * from std16_12fp.%I',p_target,p_ext);
+ 	-- проверка
+	execute format('select count(*) from retail_dwh.%I',p_ext) into v_count;
+	if v_count = 0 then
+		raise exception 'source table is empty!';
+	end if;
+	-- вставка + делит
+	execute format('truncate table retail_dwh.%I', p_target);
+
+	execute format('insert into retail_dwh.%I select * from retail_dwh.%I ', p_target ,p_ext);
+	
+	-- статистика
+	execute format('analyze retail_dwh.%I', p_target);
+	
+	exception
+		when others then
+				raise exception 'Error in full load table %: %',p_target,SQLERRM; 
+
 END;
 $$;
--- справочники
-promo_types
-stores
-promos
+SELECT retail_dwh.f_full_load('promo_types', 'promo_types_ext');
+SELECT retail_dwh.f_full_load('stores', 'store_ext');
+SELECT retail_dwh.f_full_load('promos', 'promos_ext');
 
--- AO
-coupons
-traffic
-bills_head
-bills_item
+-- создания представления для трафика
+create or replace view retail_dwh.traffic_ext_view as
+select
+	plant,
+	to_date("date",'DD.MM.YYYY') as calday,
+	"time" as caltime,
+	frame_id,
+	quantity
+	from retail_dwh.traffic_ext;
+SELECT * FROM retail_dwh.traffic_ext_view;
 
-select std16_12fp.f_full_load('promo_types','promo_types_ext');
-select std16_12fp.f_full_load('stores','store_ext');
-select std16_12fp.f_full_load('promos','promos_ext');
-
-SELECT * FROM std16_12fp.promo_types;
-select * from std16_12fp.stores;
-select * from std16_12fp.promos;
-
-select * from std16_12fp.coupons_ext;
-select * from std16_12fp.traffic_ext;
-select * from std16_12fp.bills_head_ext;
-select * from std16_12fp.bills_item_ext;
-
-
-create or replace function std16_12fp.f_delta_partition_facts(
+create or replace function retail_dwh.f_delta_partition(
 p_target varchar,
 p_ext varchar,
 p_date date
 )
-returns void 
-language plpgsql
-volatile
-execute on master
-as $$
+RETURNS void
+LANGUAGE plpgsql
+AS $$
 declare
-v_tmp_name text;
+	v_tmp_name text;
 begin
-v_tmp_name := 'tmp_fact_' || to_char(p_date,'YYYYMMDD');
-	execute format('create table %I (like std16_12fp.%I)',v_tmp_name,p_target);
-	
+	v_tmp_name :='tmp_'|| p_target || '_' || to_char(p_date, 'YYYYMMDD') ;
+
+	execute format('drop table if exists %I', v_tmp_name);
+
+	execute format('create table %I (like retail_dwh.%I)',v_tmp_name,p_target);
+
 	execute format('insert into %I 
-					select * from std16_12fp.%I
-					where calday >= %L and calday < (%L::date + interval ''1 month'')
-					',v_tmp_name,p_ext,p_date,p_date);
-	     EXECUTE format(
-            'ALTER TABLE std16_12fp.%I
-             exchange partition for (%L) with table %I',
-            p_target,p_date, v_tmp_name
-        );
-	execute format ('drop table if exists %I ',v_tmp_name);
+					select * from retail_dwh.%I
+					where calday >= %L::date  and calday < (%L::date + interval ''1 month'') ',v_tmp_name,p_ext,p_date,p_date);
+
+	execute format ('	alter table retail_dwh.%I
+						exchange partition for (%L ) 
+						with table %I',p_target,p_date,v_tmp_name);
+
+	execute format ('drop table %I',v_tmp_name);
+	
+	execute format('analyze retail_dwh.%I', p_target);
+
+	exception
+		when others then
+			raise exception 'Error in delta load table % for date %: %', p_target, p_date, SQLERRM;
 end;
 $$;
+--01
+SELECT retail_dwh.f_delta_partition('traffic', 'traffic_ext_view', '2021-01-01'::date);
+SELECT retail_dwh.f_delta_partition('coupons', 'coupons_ext', '2021-01-01'::date);
+SELECT retail_dwh.f_delta_partition('bills_head', 'bills_head_ext', '2021-01-01'::date);
+SELECT retail_dwh.f_delta_partition('bills_item', 'bills_item_ext', '2021-01-01'::date);
+
+--02
+SELECT retail_dwh.f_delta_partition('bills_head', 'bills_head_ext', '2021-02-01'::date);
+SELECT retail_dwh.f_delta_partition('bills_item', 'bills_item_ext', '2021-02-01'::date);
+SELECT retail_dwh.f_delta_partition('traffic', 'traffic_ext_view', '2021-02-01'::date);
+SELECT retail_dwh.f_delta_partition('coupons', 'coupons_ext', '2021-02-01'::date);
 
 
-SELECT std16_12fp.f_delta_partition_facts('bills_head', 'bills_head_ext', '2021-01-01');
-SELECT std16_12fp.f_delta_partition_facts('bills_head', 'bills_head_ext', '2021-02-01');
-SELECT std16_12fp.f_delta_partition_facts('bills_item', 'bills_item_ext', '2021-01-01');
-SELECT std16_12fp.f_delta_partition_facts('bills_item', 'bills_item_ext', '2021-02-01');
-SELECT std16_12fp.f_delta_partition_facts('coupons', 'coupons_ext', '2021-01-01');
-SELECT std16_12fp.f_delta_partition_facts('coupons', 'coupons_ext', '2021-02-01');
 
 
-SELECT gp_segment_id, count(*) 
-FROM std16_12fp.bills_head 
-GROUP BY gp_segment_id 
-ORDER BY gp_segment_id;
 
 
-SELECT gp_segment_id, count(*) 
-FROM std16_12fp.bills_item
-GROUP BY gp_segment_id 
-ORDER BY gp_segment_id;
-
-SELECT gp_segment_id, count(*) 
-FROM std16_12fp.coupons
-GROUP BY gp_segment_id 
-ORDER BY gp_segment_id;
 
 
-create or replace function std16_12fp.f_delta_partition_traffic(
-p_target varchar,
-p_ext varchar,
-p_date date
-)
-returns void 
-language plpgsql
-volatile
-execute on master
-as $$
-declare
-v_tmp_name text;
-begin
-v_tmp_name := 'tmp_fact_' || to_char(p_date,'YYYYMMDD');
-	execute format('create table %I (like std16_12fp.%I)',v_tmp_name,p_target);
-	
-	execute format('insert into %I 
-					select plant, to_date("date", ''DD.MM.YYYY''), "time", frame_id, quantity from std16_12fp.%I
-					where to_date("date", ''DD.MM.YYYY'') >= %L and to_date("date", ''DD.MM.YYYY'') < (%L::date + interval ''1 month'')
-					',v_tmp_name,p_ext,p_date,p_date);
-	     EXECUTE format(
-            'ALTER TABLE std16_12fp.%I
-             exchange partition for (%L) with table %I',
-            p_target,p_date, v_tmp_name
-        );
-	execute format ('drop table if exists %I ',v_tmp_name);
-end;
-$$;
-SELECT std16_12fp.f_delta_partition_traffic('traffic', 'traffic_ext', '2021-01-01');
-SELECT std16_12fp.f_delta_partition_traffic('traffic', 'traffic_ext', '2021-02-01');
-drop table std16_12fp.traffic;
 
-select * from std16_12fp.traffic;
-SELECT gp_segment_id, count(*) 
-FROM std16_12fp.traffic
-GROUP BY gp_segment_id 
-ORDER BY gp_segment_id;
 
-SELECT count(*) as trafic_table FROM std16_12fp.traffic;
-SELECT count(*) as bills_head_table FROM std16_12fp.bills_head;
-SELECT count(*) as bills_item_table FROM std16_12fp.bills_item;
-SELECT count(*) as coupons_table FROM std16_12fp.coupons;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
